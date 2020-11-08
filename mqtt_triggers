@@ -9,7 +9,7 @@ import paho.mqtt.publish
 
 DEBUG = os.environ.get('DEBUG') == '1'
 EVENT_TIMEOUT = int(os.environ.get('EVENT_TIMEOUT', 2))
-MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'mqtt2discord')
+MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'mqtt_triggers')
 MQTT_HOST = os.environ.get('MQTT_HOST', 'localhost')
 MQTT_PORT = int(os.environ.get('MQTT_PORT', '1883'))
 MQTT_TOPIC = os.environ.get('MQTT_TOPIC', 'zwave/#')

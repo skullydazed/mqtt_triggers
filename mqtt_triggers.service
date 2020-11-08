@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch MQTT for actions to take
+After=network.target
+
+[Service]
+User=pi
+Environment=MQTT_HOST=172.16.25.1
+ExecStart=/home/pi/mqtt_triggers/mqtt_triggers
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+from time import time
+
+import paho.mqtt.client
+import paho.mqtt.publish
+
+DEBUG = os.environ.get('DEBUG') == '1'
+EVENT_TIMEOUT = int(os.environ.get('EVENT_TIMEOUT', 2))
+MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'mqtt2discord')
+MQTT_HOST = os.environ.get('MQTT_HOST', 'localhost')
+MQTT_PORT = int(os.environ.get('MQTT_PORT', '1883'))
+MQTT_TOPIC = os.environ.get('MQTT_TOPIC', 'zwave/#')
+MQTT_QOS = int(os.environ.get('MQTT_QOS', 1))
+
+frontdoor_lock_state = {'last_update': 0, 'users': set()}
+frontdoor_lock_status = {'locked': None}
+frontdoor_lock_users = ['Someone', 'Zach', 'Contractor', 'Jessica']
+
+
+def mqtt_send(topic, payload):
+    try:
+        if DEBUG:
+            print(f'Sending to MQTT: {topic}: {payload}')
+        paho.mqtt.publish.single(topic, payload=payload, qos=MQTT_QOS, hostname=MQTT_HOST, port=MQTT_PORT)
+
+    except Exception as ex:
+        print("MQTT Publish Failed: " + str(ex))
+
+
+def on_connect(mqtt, userdata, flags, rc):
+    """Callback for MQTT connects."""
+    #print("MQTT connected: " + mqtt.connack_string(rc))
+    print("MQTT connected")
+    if rc != 0:
+        print("Could not connect. Error: " + str(rc))
+    else:
+        mqtt.subscribe(MQTT_TOPIC)
+
+
+def on_disconnect(mqtt, userdata, rc):
+    """Callback for MQTT disconnects."""
+    print("MQTT disconnected: " + mqtt.connack_string(rc))
+
+
+def on_log(mqtt, obj, level, string):
+    if level < 16:
+        print('***', string)
+
+
+def on_message(mqtt, userdata, msg):
+    """Callback for MQTT message PUBLISH."""
+    for event in watched_events:
+        match = event['match'].match(msg.topic)
+        if match:
+            if type(msg.payload) == bytes:
+                msg.payload = msg.payload.decode('utf-8')
+            event['callback'](msg, *match.groups(''))
+
+
+def event_office_switch(msg, *args):
+    """Callback for the office switch being pressed.
+    """
+    packet = json.loads(msg.payload)
+
+    if packet['value'] == 'Pressed 1 Time':
+        if args[0] == '1':
+            print(f'Office Lights 99%.')
+            mqtt_send('zwave/4/38/1/0/set', '99')
+            mqtt_send('zwave/5/38/1/0/set', '99')
+        elif args[0] == '2':
+            print(f'Office Lights 0%.')
+            mqtt_send('zwave/4/38/1/0/set', 'OFF')
+            mqtt_send('zwave/5/38/1/0/set', 'OFF')
+    if packet['value'] == 'Key Released':
+        if args[0] == '1':
+            print(f'Office Lights 50%.')
+            mqtt_send('zwave/4/38/1/0/set', '50')
+            mqtt_send('zwave/5/38/1/0/set', '50')
+        elif args[0] == '2':
+            print(f'Office Lights 20%.')
+            mqtt_send('zwave/4/38/1/0/set', '20')
+            mqtt_send('zwave/5/38/1/0/set', '20')
+
+
+def event_frontdoor_lock(msg, *args):
+    """Callback for frontdoor lock events.
+    """
+    global frontdoor_lock_state
+    packet = json.loads(msg.payload)
+
+    if msg.topic == 'zwave/2/113/1/260':
+        frontdoor_lock_state['users'].add(frontdoor_lock_users[int(packet['value'])])
+
+    elif msg.topic == 'zwave/2/113/1/6':
+        if packet['value'] == 'Clear':
+             if frontdoor_lock_state['last_update']:
+                 print('Firing event:', frontdoor_lock_state, frontdoor_lock_status)
+             frontdoor_lock_state = {'last_update': 0, 'users': set()}
+        else:
+            frontdoor_lock_state['operation'] = packet['value']
+            frontdoor_lock_state['last_update'] = time()
+
+    elif msg.topic == 'zwave/2/98/1/0':
+        frontdoor_lock_status['locked'] = packet['value']
+
+
+def event_door_window_sensor(msg, *args):
+    """Callback for frontdoor lock events.
+    """
+    packet = json.loads(msg.payload)
+    sensor = 'backdoor' if packet['node_id'] == 3 else f'unknown_{packet["node_id"]}'
+    door_window = 'Door'
+    status = 'opened' if packet['value'] else 'closed'
+
+    mqtt_send(f'discord/{sensor}', f"{door_window} has been {status}.")
+    
+
+
+if __name__ == '__main__':
+    # A list of event dictionaries.
+    # Each event dictionary consists of 1 or more keys:
+    #
+    #     `match`
+    #         A compiled regex object (re.compile()).
+    #     `callback`
+    #         The function to call when a match is encountered. 
+    #         `*match.groups('')` will be passed to this function.
+    watched_events = [
+        {
+            'match': re.compile(r'zwave/6/91/1/([0-9]+)'),
+            'callback': event_office_switch,
+        },
+        {
+            'match': re.compile(r'zwave/2/([0-9/]+)'),
+            'callback': event_frontdoor_lock,
+        },
+        {
+            #'match': re.compile(r'zwave/[0-9]+/113/1/6'),
+            'match': re.compile(r'zwave/[0-9]+/48/1/0'),
+            'callback': event_door_window_sensor,
+        },
+    ]
+
+    # Setup and start the mqtt app
+    mqtt = paho.mqtt.client.Client('mqtt_triggers')
+    mqtt.on_connect = on_connect
+    mqtt.on_disconnect = on_disconnect
+    mqtt.on_log = on_log
+    mqtt.on_message = on_message
+    mqtt.connect(MQTT_HOST, MQTT_PORT, 60)
+    #mqtt.loop_forever()
+    while True:
+        mqtt.loop()
+        if frontdoor_lock_state['last_update'] and time() - frontdoor_lock_state['last_update'] > EVENT_TIMEOUT:
+            userlist = ','.join(frontdoor_lock_state['users'])
+            lock_status = 'locked' if frontdoor_lock_status['locked'] else 'unlocked'
+            if frontdoor_lock_state['users']:
+                if 'Zach' in frontdoor_lock_state['users']:
+                    status = ('OFF','OFF') if frontdoor_lock_status['locked'] else ('ON', 99)
+                    mqtt_send('zwave/5/38/1/0/set', status[1])
+                    mqtt_send('zwave/4/38/1/0/set', status[1])
+                    mqtt_send('homeassistant/switch/meross_mqtt/1909186558887525186548e1e9054b50/0/set', status[0])
+                mqtt_send('discord/frontdoor', f"{userlist} did {frontdoor_lock_state['operation']}. Door is {lock_status}.")
+            else:
+                mqtt_send('discord/frontdoor', f"Someone did {frontdoor_lock_state['operation']}. Door is {lock_status}.")
+
+            frontdoor_lock_state = {'last_update': 0, 'users': set()}

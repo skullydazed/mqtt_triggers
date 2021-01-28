@@ -4,22 +4,48 @@ import os
 import re
 from threading import Thread
 from time import sleep, time
+from traceback import print_exc
 
 import paho.mqtt.client
 import paho.mqtt.publish
 
-DEBUG = os.environ.get('DEBUG') == '1'
+DEBUG = os.environ.get('DEBUG', '1') == '1'
 EVENT_TIMEOUT = int(os.environ.get('EVENT_TIMEOUT', 2))
 MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'mqtt_triggers')
 MQTT_HOST = os.environ.get('MQTT_HOST', 'localhost')
 MQTT_PORT = int(os.environ.get('MQTT_PORT', '1883'))
-MQTT_TOPIC = os.environ.get('MQTT_TOPIC', 'zwave/#,plug02/switch/plug_02_relay/state')
+MQTT_TOPIC = os.environ.get('MQTT_TOPIC', 'zwave/#,plug02/switch/plug_02_relay/state,office_sensor/binary_sensor/office_motion/state')
 MQTT_QOS = int(os.environ.get('MQTT_QOS', 1))
 
-frontdoor_lock_state = {'last_update': 0, 'users': set()}
-frontdoor_lock_status = {'locked': None}
-frontdoor_lock_users = ['Someone', 'Zach', 'Contractor', 'Jessica']
+# Used for events that fire in the future. Each item is a dictionary:
+# {
+#     'timestamp': unix_timestamp,
+#     'callback': callback_function,
+#     'args': [...],
+#     'kwargs': [...]
+# }
+timers = []
 
+# Turn on lights for motion sensors. Format:
+# {
+#     'switch': mqtt_node_for_switch,
+#     'sensor': mqtt_node_for_sensor,
+#     'timeout': seconds_before_light_off,
+#     'name': room_name,
+#     'last_change': unix_timestamp,
+#     'sensor_state': boolean,
+#     'switch_state': boolean
+# }
+office_motion_state = {
+    'switch': 'zwave/Office/3/37/1/0/set',
+    'sensor': 'office_sensor/binary_sensor/office_motion/state',
+    'timeout': 300,
+    'name': 'Office',
+    'last_change': 0,
+    'sensor_state': None,
+    'switch_state': None
+}
+motion_sensors = [office_motion_state]
 
 def mqtt_send(topic, payload):
     try:
@@ -54,12 +80,18 @@ def on_log(mqtt, obj, level, string):
 
 def on_message(mqtt, userdata, msg):
     """Callback for MQTT message PUBLISH."""
-    for event in watched_events:
-        match = event['match'].match(msg.topic)
-        if match:
-            if type(msg.payload) == bytes:
-                msg.payload = msg.payload.decode('utf-8')
-            event['callback'](msg, *match.groups(''))
+    try:
+        for event in watched_events:
+            match = event['match'].match(msg.topic)
+            if match:
+                if type(msg.payload) == bytes:
+                    msg.payload = msg.payload.decode('utf-8')
+                event['callback'](msg, *match.groups(''))
+
+    except Exception as e:
+        print(f'*** Exception: {e.__class__.__name__}: {e}')
+        print_exc()
+        return
 
 
 def event_office_switch(msg, *args):
@@ -67,15 +99,29 @@ def event_office_switch(msg, *args):
     """
     packet = json.loads(msg.payload)
     command = 'on' if packet['value'] else 'off'
+    office_motion_state['switch_state'] = packet['value']
 
     print(f'*** Office lights {command}, turning {command} enail.')
     mqtt_send('plug03/switch/plug_03_relay/command', command)
 
 
+def event_office_motion(msg, *args):
+    """Callback to store state of the office motion sensor
+    """
+    new_state = msg.payload.lower() == 'on'
+
+    if office_motion_state['sensor_state'] is False and new_state:
+        print('*** Turning office on.')
+        mqtt_send(office_motion_state['switch'], 'ON')
+
+    office_motion_state['last_change'] = time()
+    office_motion_state['sensor_state'] = new_state
+    print(f'*** New office_motion_state: {office_motion_state}')
+
+
 def bed_lights_off(timeout=120):
     """Turn the bed lights off after a timeout.
     """
-    sleep(timeout)
     print('*** Turning off bed lights now.')
     mqtt_send('plug02/switch/plug_02_relay/command', 'off')
 
@@ -85,33 +131,12 @@ def event_bed_lights(msg, *args):
     """
     if msg.payload.lower() == 'on':
         print('*** Turning off bed lights in 2 minutes.')
-        Thread(target=bed_lights_off, name='bed_lights_off', daemon=True).start()
-
-
-def event_frontdoor_lock(msg, *args):
-    """Callback for frontdoor lock events.
-    """
-    global frontdoor_lock_state
-    packet = json.loads(msg.payload)
-
-    if msg.topic == 'zwave/2/113/1/260':
-        frontdoor_lock_state['users'].add(frontdoor_lock_users[int(packet['value'])])
-
-    elif msg.topic == 'zwave/2/113/1/6':
-        if packet['value'] == 'Clear':
-             if frontdoor_lock_state['last_update']:
-                 print('Firing event:', frontdoor_lock_state, frontdoor_lock_status)
-             frontdoor_lock_state = {'last_update': 0, 'users': set()}
-        else:
-            frontdoor_lock_state['operation'] = packet['value']
-            frontdoor_lock_state['last_update'] = time()
-
-    elif msg.topic == 'zwave/2/98/1/0':
-        frontdoor_lock_status['locked'] = packet['value']
+        end_time = time() + 120
+        timers.append({'timestamp': end_time, 'callback': bed_lights_off})
 
 
 def event_door_window_sensor(msg, *args):
-    """Callback for frontdoor lock events.
+    """Callback for door and window sensor changes
     """
     packet = json.loads(msg.payload)
     sensor = 'backdoor' if packet['node_id'] == 3 else f'unknown_{packet["node_id"]}'
@@ -133,15 +158,19 @@ if __name__ == '__main__':
     #         `*match.groups('')` will be passed to this function.
     watched_events = [
         {
-            'match': re.compile(r'zwave/Office/3/37/1/0'),
+            'match': re.compile(r'^zwave/Office/3/37/1/0$'),
             'callback': event_office_switch,
         },
         {
-            'match': re.compile(r'plug02/switch/plug_02_relay/state'),
+            'match': re.compile(r'^office_sensor/binary_sensor/office_motion/state$'),
+            'callback': event_office_motion,
+        },
+        {
+            'match': re.compile(r'^plug02/switch/plug_02_relay/state$'),
             'callback': event_bed_lights,
         },
         {
-            'match': re.compile(r'zwave/[0-9]+/48/1/0'),
+            'match': re.compile(r'^zwave/[0-9]+/48/1/0$'),
             'callback': event_door_window_sensor,
         },
     ]
@@ -153,6 +182,25 @@ if __name__ == '__main__':
     mqtt.on_log = on_log
     mqtt.on_message = on_message
     mqtt.connect(MQTT_HOST, MQTT_PORT, 60)
-    mqtt.loop_forever()
-    #while True:
-    #    mqtt.loop()
+    #mqtt.loop_forever()
+    
+    while True:
+        mqtt.loop()
+
+        # Check for timers that need to be executed
+        for event in timers[:]:  # Avoid changing an object during iteration
+            if event['timestamp'] < time():
+                event['callback'](*event.get('args', []), **event.get('kwargs', {}))
+                timers.remove(event)
+
+        # Check the state of motion sensors
+        for motion_sensor in motion_sensors:
+            timeout = motion_sensor['timeout'] + motion_sensor['last_change']
+
+            if motion_sensor['sensor_state'] is False and motion_sensor['switch_state'] is True and timeout < time():
+                print(f'Turning {motion_sensor["name"]} off due to motion timeout.')
+                mqtt_send(motion_sensor['switch'], 'OFF')
+                motion_sensor['last_change'] = time()
+
+        # Take 5(ms)
+        sleep(0.005)

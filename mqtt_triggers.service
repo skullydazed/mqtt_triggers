@@ -3,9 +3,11 @@ Description=Watch MQTT for actions to take
 After=network.target
 
 [Service]
-User=pi
-Environment=MQTT_HOST=172.16.25.1
-ExecStart=/home/pi/mqtt_triggers/mqtt_triggers
+Restart=on-failure
+RestartSec=5s
+User=zwhite
+Environment=MQTT_HOST=127.0.0.1
+ExecStart=/home/zwhite/mqtt_triggers/mqtt_triggers
 
 [Install]
 WantedBy=multi-user.target

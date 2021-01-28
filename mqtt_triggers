@@ -1,8 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -u
 import json
 import os
 import re
-from time import time
+from threading import Thread
+from time import sleep, time
 
 import paho.mqtt.client
 import paho.mqtt.publish
@@ -12,7 +13,7 @@ EVENT_TIMEOUT = int(os.environ.get('EVENT_TIMEOUT', 2))
 MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'mqtt_triggers')
 MQTT_HOST = os.environ.get('MQTT_HOST', 'localhost')
 MQTT_PORT = int(os.environ.get('MQTT_PORT', '1883'))
-MQTT_TOPIC = os.environ.get('MQTT_TOPIC', 'zwave/#')
+MQTT_TOPIC = os.environ.get('MQTT_TOPIC', 'zwave/#,plug02/switch/plug_02_relay/state')
 MQTT_QOS = int(os.environ.get('MQTT_QOS', 1))
 
 frontdoor_lock_state = {'last_update': 0, 'users': set()}
@@ -37,7 +38,8 @@ def on_connect(mqtt, userdata, flags, rc):
     if rc != 0:
         print("Could not connect. Error: " + str(rc))
     else:
-        mqtt.subscribe(MQTT_TOPIC)
+        for topic in MQTT_TOPIC.split(','):
+            mqtt.subscribe(topic.strip())
 
 
 def on_disconnect(mqtt, userdata, rc):
@@ -64,25 +66,26 @@ def event_office_switch(msg, *args):
     """Callback for the office switch being pressed.
     """
     packet = json.loads(msg.payload)
+    command = 'on' if packet['value'] else 'off'
 
-    if packet['value'] == 'Pressed 1 Time':
-        if args[0] == '1':
-            print(f'Office Lights 99%.')
-            mqtt_send('zwave/4/38/1/0/set', '99')
-            mqtt_send('zwave/5/38/1/0/set', '99')
-        elif args[0] == '2':
-            print(f'Office Lights 0%.')
-            mqtt_send('zwave/4/38/1/0/set', 'OFF')
-            mqtt_send('zwave/5/38/1/0/set', 'OFF')
-    if packet['value'] == 'Key Released':
-        if args[0] == '1':
-            print(f'Office Lights 50%.')
-            mqtt_send('zwave/4/38/1/0/set', '50')
-            mqtt_send('zwave/5/38/1/0/set', '50')
-        elif args[0] == '2':
-            print(f'Office Lights 20%.')
-            mqtt_send('zwave/4/38/1/0/set', '20')
-            mqtt_send('zwave/5/38/1/0/set', '20')
+    print(f'*** Office lights {command}, turning {command} enail.')
+    mqtt_send('plug03/switch/plug_03_relay/command', command)
+
+
+def bed_lights_off(timeout=120):
+    """Turn the bed lights off after a timeout.
+    """
+    sleep(timeout)
+    print('*** Turning off bed lights now.')
+    mqtt_send('plug02/switch/plug_02_relay/command', 'off')
+
+
+def event_bed_lights(msg, *args):
+    """Callback for the bed lights being turned on
+    """
+    if msg.payload.lower() == 'on':
+        print('*** Turning off bed lights in 2 minutes.')
+        Thread(target=bed_lights_off, name='bed_lights_off', daemon=True).start()
 
 
 def event_frontdoor_lock(msg, *args):
@@ -130,15 +133,14 @@ if __name__ == '__main__':
     #         `*match.groups('')` will be passed to this function.
     watched_events = [
         {
-            'match': re.compile(r'zwave/6/91/1/([0-9]+)'),
+            'match': re.compile(r'zwave/Office/3/37/1/0'),
             'callback': event_office_switch,
         },
         {
-            'match': re.compile(r'zwave/2/([0-9/]+)'),
-            'callback': event_frontdoor_lock,
+            'match': re.compile(r'plug02/switch/plug_02_relay/state'),
+            'callback': event_bed_lights,
         },
         {
-            #'match': re.compile(r'zwave/[0-9]+/113/1/6'),
             'match': re.compile(r'zwave/[0-9]+/48/1/0'),
             'callback': event_door_window_sensor,
         },
@@ -151,20 +153,6 @@ if __name__ == '__main__':
     mqtt.on_log = on_log
     mqtt.on_message = on_message
     mqtt.connect(MQTT_HOST, MQTT_PORT, 60)
-    #mqtt.loop_forever()
-    while True:
-        mqtt.loop()
-        if frontdoor_lock_state['last_update'] and time() - frontdoor_lock_state['last_update'] > EVENT_TIMEOUT:
-            userlist = ','.join(frontdoor_lock_state['users'])
-            lock_status = 'locked' if frontdoor_lock_status['locked'] else 'unlocked'
-            if frontdoor_lock_state['users']:
-                if 'Zach' in frontdoor_lock_state['users']:
-                    status = ('OFF','OFF') if frontdoor_lock_status['locked'] else ('ON', 99)
-                    mqtt_send('zwave/5/38/1/0/set', status[1])
-                    mqtt_send('zwave/4/38/1/0/set', status[1])
-                    mqtt_send('homeassistant/switch/meross_mqtt/1909186558887525186548e1e9054b50/0/set', status[0])
-                mqtt_send('discord/frontdoor', f"{userlist} did {frontdoor_lock_state['operation']}. Door is {lock_status}.")
-            else:
-                mqtt_send('discord/frontdoor', f"Someone did {frontdoor_lock_state['operation']}. Door is {lock_status}.")
-
-            frontdoor_lock_state = {'last_update': 0, 'users': set()}
+    mqtt.loop_forever()
+    #while True:
+    #    mqtt.loop()
